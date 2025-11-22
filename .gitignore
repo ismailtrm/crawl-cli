@@ -1,0 +1,14 @@
+# Binaries
+crawl-cli
+main
+
+# Environment
+.env
+.gemini/
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+*.log
