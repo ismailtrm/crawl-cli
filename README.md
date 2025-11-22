@@ -82,10 +82,9 @@ crawl-cli --link "https://techcrunch.com" \
 |------|-------------|---------|
 | `--link` | The target URL to crawl (required) | | 
 | `--depth` | Crawl depth (0=single page, 1=links on page, etc) | 0 | 
-| `--scrape` | Output raw HTML to stdout and exit | false | 
-| `--browserless` | URL of your Browserless instance (e.g. `https://chrome.example.com`) | "" | 
-| `--token` | Browserless API Token (can also use `BROWSERLESS_TOKEN` env var) | "" | 
-| `--llm` | Enable Gemini 2.5 Flash integration | false | 
+| `--scrape` | Output raw HTML to stdout and exit | false |
+| `--browserless` | URL of your Browserless instance (can also use `BROWSERLESS_URL` env var) | "" |
+| `--token` | Browserless API Token (can also use `BROWSERLESS_TOKEN` env var) | "" || `--llm` | Enable Gemini 2.5 Flash integration | false | 
 | `--purpose` | Describe goal for LLM to score relevance | "" | 
 | `--verbose` | Show detailed logs and content previews | false | 
 | `--timeout` | HTTP request timeout | 30s | 

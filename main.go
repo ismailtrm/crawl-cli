@@ -459,6 +459,11 @@ func main() {
 		*token = os.Getenv("BROWSERLESS_TOKEN")
 	}
 
+	// Check environment variable for browserless URL if flag is empty
+	if *browserless == "" {
+		*browserless = os.Getenv("BROWSERLESS_URL")
+	}
+
 	crawler := NewCrawler(*timeout, *depth, *verbose, *llm, *purpose, *insecure, *browserless, *token)
 
 	// Scrape mode: Fetch and print raw HTML
