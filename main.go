@@ -19,35 +19,35 @@ import (
 
 // CrawlResult stores the results of crawling a page
 type CrawlResult struct {
-	URL         string
-	Title       string
-	Links       []string
-	Text        string
-	Images      []string
-	StatusCode  int
-	ContentType string
-	Error       error
-	// LLM-enhanced fields
+	URL            string
+	Title          string
+	Links          []string
+	Text           string
+	Images         []string
+	StatusCode     int
+	ContentType    string
+	Error          error
 	Summary        string   `json:"summary,omitempty"`
 	Topics         []string `json:"topics,omitempty"`
-	Relevance      int      `json:"relevance,omitempty"` // 1-10 score
+	Relevance      int      `json:"relevance,omitempty"`
 	SuggestedLinks []string `json:"suggested_links,omitempty"`
 }
 
 // Crawler configuration
 type Crawler struct {
-	client       *http.Client
-	maxDepth     int
-	currentDepth int
-	visited      map[string]bool
-	baseURL      *url.URL
-	verbose      bool
-	llmEnabled   bool
-	geminiAPIKey string
-	crawlPurpose string
+	client          *http.Client
+	maxDepth        int
+	currentDepth    int
+	visited         map[string]bool
+	baseURL         *url.URL
+	verbose         bool
+	llmEnabled      bool
+	geminiAPIKey    string
+	crawlPurpose    string
+	browserlessURL  string
+	browserlessToken string
 }
 
-// GeminiRequest structure for API calls
 type GeminiRequest struct {
 	Contents []GeminiContent `json:"contents"`
 }
@@ -60,7 +60,6 @@ type GeminiPart struct {
 	Text string `json:"text"`
 }
 
-// GeminiResponse structure
 type GeminiResponse struct {
 	Candidates []struct {
 		Content struct {
@@ -71,7 +70,6 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
-// LLMAnalysis structure for parsing LLM responses
 type LLMAnalysis struct {
 	Summary        string   `json:"summary"`
 	Topics         []string `json:"topics"`
@@ -81,8 +79,7 @@ type LLMAnalysis struct {
 	Priority       int      `json:"priority"`
 }
 
-// NewCrawler creates a new crawler instance
-func NewCrawler(timeout time.Duration, maxDepth int, verbose bool, llmEnabled bool, purpose string, insecure bool) *Crawler {
+func NewCrawler(timeout time.Duration, maxDepth int, verbose bool, llmEnabled bool, purpose string, insecure bool, browserlessURL string, browserlessToken string) *Crawler {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
 	}
@@ -92,11 +89,13 @@ func NewCrawler(timeout time.Duration, maxDepth int, verbose bool, llmEnabled bo
 			Timeout:   timeout,
 			Transport: transport,
 		},
-		maxDepth:     maxDepth,
-		visited:      make(map[string]bool),
-		verbose:      verbose,
-		llmEnabled:   llmEnabled,
-		crawlPurpose: purpose,
+		maxDepth:         maxDepth,
+		visited:          make(map[string]bool),
+		verbose:          verbose,
+		llmEnabled:       llmEnabled,
+		crawlPurpose:     purpose,
+		browserlessURL:   browserlessURL,
+		browserlessToken: browserlessToken,
 	}
 
 	if llmEnabled {
@@ -109,7 +108,6 @@ func NewCrawler(timeout time.Duration, maxDepth int, verbose bool, llmEnabled bo
 	return crawler
 }
 
-// Crawl fetches and parses a single URL
 func (c *Crawler) Crawl(targetURL string) (*CrawlResult, error) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
@@ -132,48 +130,57 @@ func (c *Crawler) Crawl(targetURL string) (*CrawlResult, error) {
 	c.visited[targetURL] = true
 
 	if c.verbose {
-		fmt.Printf("Crawling: %s\n", targetURL)
+		mode := "Standard HTTP"
+		if c.browserlessURL != "" {
+			mode = "Browserless (REST API)"
+		}
+		fmt.Printf("Crawling [%s]: %s\n", mode, targetURL)
 	}
 
-	resp, err := c.client.Get(targetURL)
-	if err != nil {
-		return &CrawlResult{
-			URL:   targetURL,
-			Error: err,
-		}, err
-	}
-	defer resp.Body.Close()
+	var body []byte
+	var contentType string
+	var statusCode int
 
-	contentType := resp.Header.Get("Content-Type")
-	if !strings.Contains(contentType, "text/html") {
-		return &CrawlResult{
-			URL:         targetURL,
-			StatusCode:  resp.StatusCode,
-			ContentType: contentType,
-		}, nil
-	}
+	// Choose between Browserless and Standard HTTP
+	if c.browserlessURL != "" {
+		body, err = c.fetchWithChrome(targetURL)
+		if err != nil {
+			return &CrawlResult{URL: targetURL, Error: err}, err
+		}
+		contentType = "text/html" // Browserless always returns rendered HTML
+		statusCode = 200          // Assumption for successful rendering
+	} else {
+		resp, err := c.client.Get(targetURL)
+		if err != nil {
+			return &CrawlResult{URL: targetURL, Error: err}, err
+		}
+		defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return &CrawlResult{
-			URL:        targetURL,
-			StatusCode: resp.StatusCode,
-			Error:      err,
-		}, err
+		statusCode = resp.StatusCode
+		contentType = resp.Header.Get("Content-Type")
+		if !strings.Contains(contentType, "text/html") {
+			return &CrawlResult{
+				URL:         targetURL,
+				StatusCode:  statusCode,
+				ContentType: contentType,
+			},
+			nil
+		}
+
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return &CrawlResult{URL: targetURL, Error: err}, err
+		}
 	}
 
 	doc, err := html.Parse(strings.NewReader(string(body)))
 	if err != nil {
-		return &CrawlResult{
-			URL:        targetURL,
-			StatusCode: resp.StatusCode,
-			Error:      err,
-		}, err
+		return &CrawlResult{URL: targetURL, Error: err}, err
 	}
 
 	result := &CrawlResult{
 		URL:         targetURL,
-		StatusCode:  resp.StatusCode,
+		StatusCode:  statusCode,
 		ContentType: contentType,
 		Links:       []string{},
 		Images:      []string{},
@@ -183,27 +190,87 @@ func (c *Crawler) Crawl(targetURL string) (*CrawlResult, error) {
 
 	if c.llmEnabled {
 		err := c.enhanceWithLLM(result, string(body))
-		if err != nil {
-			if c.verbose {
-				fmt.Printf("LLM analysis failed for %s: %v\n", targetURL, err)
-			}
+		if err != nil && c.verbose {
+			fmt.Printf("LLM analysis failed: %v\n", err)
 		}
 	}
 
 	return result, nil
 }
 
-func (c *Crawler) enhanceWithLLM(result *CrawlResult, htmlContent string) error {
-	prompt := c.buildAnalysisPrompt(result, htmlContent)
-
-	analysis, err := c.callGemini(prompt)
-	if err != nil {
-		return fmt.Errorf("failed to call Gemini API: %w", err)
+// fetchWithChrome uses Browserless REST API (/content) to render the page
+func (c *Crawler) fetchWithChrome(targetURL string) ([]byte, error) {
+	// Clean up the base URL. If user provided "wss://", change to "https://"
+	apiURL := c.browserlessURL
+	apiURL = strings.Replace(apiURL, "wss://", "https://", 1)
+	apiURL = strings.Replace(apiURL, "ws://", "http://", 1)
+	
+	// Ensure we hit the /content endpoint
+	if !strings.HasSuffix(apiURL, "/content") {
+		apiURL = strings.TrimSuffix(apiURL, "/")
+		apiURL = apiURL + "/content"
 	}
 
+	// Add token if present
+	if c.browserlessToken != "" {
+		apiURL = fmt.Sprintf("%s?token=%s", apiURL, c.browserlessToken)
+	}
+
+	// Create JSON payload
+	payload := map[string]interface{}{
+		"url": targetURL,
+		// Optional: Add wait conditions or other Browserless options here
+		// "waitFor": 5000, // Wait 5 seconds (handled by server)
+		// "rejectResourceTypes": []string{"image", "media"}, // Speed up by blocking images
+	}
+	
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	if c.verbose {
+		fmt.Printf("DEBUG: Calling Browserless API: %s\n", apiURL)
+	}
+
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("browserless API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("browserless API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	htmlContent, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read browserless response: %w", err)
+	}
+
+	if c.verbose {
+		fmt.Printf("Browserless fetched %d bytes of HTML\n", len(htmlContent))
+	}
+
+	return htmlContent, nil
+}
+
+func (c *Crawler) enhanceWithLLM(result *CrawlResult, htmlContent string) error {
+	prompt := c.buildAnalysisPrompt(result, htmlContent)
+	analysis, err := c.callGemini(prompt)
+	if err != nil {
+		return err
+	}
 	llmResult, err := c.parseLLMResponse(analysis)
 	if err != nil {
-		return fmt.Errorf("failed to parse LLM response: %w", err)
+		return err
 	}
 
 	result.Summary = llmResult.Summary
@@ -212,15 +279,8 @@ func (c *Crawler) enhanceWithLLM(result *CrawlResult, htmlContent string) error 
 	result.SuggestedLinks = llmResult.SuggestedLinks
 
 	if c.verbose {
-		fmt.Printf("[LLM Analysis] %s\n", result.URL)
-		fmt.Printf("   Relevance: %d/10\n", result.Relevance)
-		fmt.Printf("   Topics: %s\n", strings.Join(result.Topics, ", "))
-		fmt.Printf("   Summary: %s\n", result.Summary)
-		if len(result.SuggestedLinks) > 0 {
-			fmt.Printf("   Suggested priority links: %d\n", len(result.SuggestedLinks))
-		}
+		fmt.Printf("[LLM Analysis] Relevance: %d/10 | Topics: %s\n", result.Relevance, strings.Join(result.Topics, ", "))
 	}
-
 	return nil
 }
 
@@ -232,79 +292,43 @@ func (c *Crawler) buildAnalysisPrompt(result *CrawlResult, htmlContent string) s
 
 	purpose := c.crawlPurpose
 	if purpose == "" {
-		purpose = "general web crawling and content discovery"
+		purpose = "general web crawling"
 	}
 
-	prompt := fmt.Sprintf(`You are an AI assistant helping with intelligent web crawling. 
-
-CRAWL PURPOSE: %s
-
-Analyze the following webpage and provide structured insights:
-
-URL: %s
-Title: %s
-Text Content: %s
-
-Based on this content, please provide a JSON response with the following structure:
-{
-  "summary": "Brief 2-3 sentence summary of the page content",
-  "topics": ["topic1", "topic2", "topic3"],
-  "relevance": 8,
-  "suggested_links": ["url1", "url2"],
-  "should_crawl": true,
-  "priority": 7
-}
-
-Guidelines:
-- relevance: Score 1-10 how relevant this page is to the crawl purpose
-- topics: Extract 3-5 main topics/themes from the content
-- suggested_links: From the links found, suggest up to 3 most promising ones to crawl next
-- should_crawl: Whether this type of content is worth crawling
-- priority: How important this page is (1-10, higher = more important)
-
-Respond ONLY with valid JSON, no other text.`, purpose, result.URL, result.Title, result.Text[:min(2000, len(result.Text))])
-
-	return prompt
+	return fmt.Sprintf(`Analyze this webpage. Purpose: %s. URL: %s. Title: %s. Content: %s.
+	Return ONLY valid JSON:
+	{
+	  "summary": "Brief summary",
+	  "topics": ["topic1", "topic2"],
+	  "relevance": 8,
+	  "suggested_links": ["url1"],
+	  "should_crawl": true,
+	  "priority": 7
+	}`, purpose, result.URL, result.Title, result.Text[:min(2000, len(result.Text))])
 }
 
 func (c *Crawler) callGemini(prompt string) (string, error) {
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", c.geminiAPIKey)
-
-	request := GeminiRequest{
-		Contents: []GeminiContent{
-			{
-				Parts: []GeminiPart{
-					{Text: prompt},
-				},
-			},
-		},
-	}
-
-	jsonData, err := json.Marshal(request)
-	if err != nil {
-		return "", err
-	}
-
+	request := GeminiRequest{Contents: []GeminiContent{{Parts: []GeminiPart{{Text: prompt}}}}}
+	
+	jsonData, _ := json.Marshal(request)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API call failed with status %d: %s", resp.StatusCode, string(body))
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("API error: %d", resp.StatusCode)
 	}
 
 	var response GeminiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return "", err
 	}
-
-	if len(response.Candidates) == 0 || len(response.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("empty response from Gemini")
+	if len(response.Candidates) == 0 {
+		return "", fmt.Errorf("empty response")
 	}
-
 	return response.Candidates[0].Content.Parts[0].Text, nil
 }
 
@@ -312,28 +336,22 @@ func (c *Crawler) parseLLMResponse(response string) (*LLMAnalysis, error) {
 	response = strings.TrimPrefix(response, "```json")
 	response = strings.TrimSuffix(response, "```")
 	response = strings.TrimSpace(response)
-
 	var analysis LLMAnalysis
 	err := json.Unmarshal([]byte(response), &analysis)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w, response was: %s", err, response)
-	}
-
-	return &analysis, nil
+	return &analysis, err
 }
 
 func (c *Crawler) extractData(n *html.Node, result *CrawlResult, baseURL *url.URL) {
 	if n.Type == html.ElementNode {
 		switch n.Data {
 		case "title":
-			if n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+			if n.FirstChild != nil {
 				result.Title = strings.TrimSpace(n.FirstChild.Data)
 			}
 		case "a":
 			for _, attr := range n.Attr {
 				if attr.Key == "href" {
-					link := c.resolveURL(attr.Val, baseURL)
-					if link != "" {
+					if link := c.resolveURL(attr.Val, baseURL); link != "" {
 						result.Links = append(result.Links, link)
 					}
 				}
@@ -341,30 +359,27 @@ func (c *Crawler) extractData(n *html.Node, result *CrawlResult, baseURL *url.UR
 		case "img":
 			for _, attr := range n.Attr {
 				if attr.Key == "src" {
-					imgURL := c.resolveURL(attr.Val, baseURL)
-					if imgURL != "" {
+					if imgURL := c.resolveURL(attr.Val, baseURL); imgURL != "" {
 						result.Images = append(result.Images, imgURL)
 					}
 				}
 			}
-		case "p", "div", "span", "h1", "h2", "h3", "h4", "h5", "h6", "article", "section":
-			text := c.extractText(n)
-			if text != "" && len(text) > 10 {
+		case "p", "div", "h1", "h2", "article":
+			if text := c.extractText(n); len(text) > 10 {
 				result.Text += text + "\n"
 			}
 		}
 	}
-
 	for child := n.FirstChild; child != nil; child = child.NextSibling {
 		c.extractData(child, result, baseURL)
 	}
 }
 
 func (c *Crawler) extractText(n *html.Node) string {
-	var text string
 	if n.Type == html.TextNode {
-		text = strings.TrimSpace(n.Data)
+		return strings.TrimSpace(n.Data)
 	}
+	var text string
 	for child := n.FirstChild; child != nil; child = child.NextSibling {
 		text += " " + c.extractText(child)
 	}
@@ -373,253 +388,109 @@ func (c *Crawler) extractText(n *html.Node) string {
 
 func (c *Crawler) resolveURL(href string, base *url.URL) string {
 	u, err := url.Parse(href)
-	if err != nil {
+	if err != nil || (u.Scheme != "" && u.Scheme != "http" && u.Scheme != "https") {
 		return ""
 	}
-
-	if u.Scheme != "" && u.Scheme != "http" && u.Scheme != "https" {
-		return ""
-	}
-
-	resolved := base.ResolveReference(u)
-	return resolved.String()
+	return base.ResolveReference(u).String()
 }
 
 func (c *Crawler) CrawlRecursive(targetURL string, depth int) ([]*CrawlResult, error) {
 	if depth > c.maxDepth {
 		return nil, nil
 	}
-
-	results := []*CrawlResult{}
-
 	result, err := c.Crawl(targetURL)
-	if err != nil && result == nil {
-		return results, err
+	if err != nil {
+		return nil, err
 	}
-
-	if result != nil {
-		results = append(results, result)
-
-		if depth < c.maxDepth && result.Links != nil {
-			linksToProcess := result.Links
-			if c.llmEnabled && len(result.SuggestedLinks) > 0 {
-				linksToProcess = result.SuggestedLinks
-				if c.verbose {
-					fmt.Printf("[Info] Using LLM-suggested links (%d) instead of all links (%d)\n",
-						len(result.SuggestedLinks), len(result.Links))
-				}
-			}
-
-			for _, link := range linksToProcess {
-				linkURL, err := url.Parse(link)
-				if err != nil {
-					continue
-				}
-
-				if linkURL.Host == c.baseURL.Host {
-					if c.llmEnabled && result.Relevance < 5 {
-						if c.verbose {
-							fmt.Printf("[Skip] Low relevance page (score: %d): %s\n", result.Relevance, link)
-						}
-						continue
-					}
-
-					subResults, _ := c.CrawlRecursive(link, depth+1)
-					results = append(results, subResults...)
-				}
+	
+	results := []*CrawlResult{result}
+	if depth < c.maxDepth {
+		links := result.Links
+		if c.llmEnabled && len(result.SuggestedLinks) > 0 {
+			links = result.SuggestedLinks
+		}
+		for _, link := range links {
+			if u, _ := url.Parse(link); u != nil && u.Host == c.baseURL.Host {
+				sub, _ := c.CrawlRecursive(link, depth+1)
+				results = append(results, sub...)
 			}
 		}
 	}
-
 	return results, nil
 }
 
 func PrintResult(result *CrawlResult, verbose bool, llmEnabled bool) {
-	fmt.Printf("\n" + strings.Repeat("=", 80) + "\n")
-	fmt.Printf("URL: %s\n", result.URL)
-	fmt.Printf("Status: %d\n", result.StatusCode)
-	fmt.Printf("Content-Type: %s\n", result.ContentType)
-
-	if result.Error != nil {
-		fmt.Printf("Error: %v\n", result.Error)
-		return
-	}
-
+	fmt.Printf("\n=== %s ===\n", result.URL)
 	if result.Title != "" {
 		fmt.Printf("Title: %s\n", result.Title)
 	}
-
 	if llmEnabled {
-		if result.Relevance > 0 {
-			fmt.Printf("Relevance Score: %d/10\n", result.Relevance)
-		}
-		if len(result.Topics) > 0 {
-			fmt.Printf("Topics: %s\n", strings.Join(result.Topics, ", "))
-		}
-		if result.Summary != "" {
-			fmt.Printf("Summary: %s\n", result.Summary)
-		}
+		fmt.Printf("Relevance: %d | Summary: %s\n", result.Relevance, result.Summary)
 	}
-
-	if len(result.Links) > 0 {
-		fmt.Printf("\nFound %d links:\n", len(result.Links))
-		if verbose {
-			displayCount := min(10, len(result.Links))
-			for i := 0; i < displayCount; i++ {
-				fmt.Printf("  - %s\n", result.Links[i])
-			}
-			if len(result.Links) > 10 {
-				fmt.Printf("  ... and %d more\n", len(result.Links)-10)
-			}
-		}
-	}
-
-	if llmEnabled && len(result.SuggestedLinks) > 0 {
-		fmt.Printf("\nLLM Suggested Priority Links (%d):\n", len(result.SuggestedLinks))
-		if verbose {
-			for _, link := range result.SuggestedLinks {
-				fmt.Printf("  - %s\n", link)
-			}
-		}
-	}
-
-	if len(result.Images) > 0 {
-		fmt.Printf("\nFound %d images:\n", len(result.Images))
-		if verbose {
-			displayCount := min(5, len(result.Images))
-			for i := 0; i < displayCount; i++ {
-				fmt.Printf("  - %s\n", result.Images[i])
-			}
-			if len(result.Images) > 5 {
-				fmt.Printf("  ... and %d more\n", len(result.Images)-5)
-			}
-		}
-	}
-
-	if result.Text != "" && verbose {
-		fmt.Printf("\nText content preview:\n")
-		preview := result.Text
-		if len(preview) > 500 {
-			preview = preview[:500] + "..."
-		}
-		fmt.Printf("%s\n", preview)
-	}
+	fmt.Printf("Links: %d | Images: %d\n", len(result.Links), len(result.Images))
 }
 
 func min(a, b int) int {
-	if a < b {
-		return a
-	}
+	if a < b { return a }
 	return b
 }
 
 func main() {
-	var (
-		link     = flag.String("link", "", "URL to crawl (required)")
-		depth    = flag.Int("depth", 0, "Maximum crawl depth (0 = single page, 1 = page + its links, etc.)")
-		timeout  = flag.Duration("timeout", 30*time.Second, "HTTP request timeout")
-		verbose  = flag.Bool("verbose", false, "Enable verbose output")
-		llm      = flag.Bool("llm", false, "Enable LLM-powered intelligent crawling with Gemini 2.5 Flash")
-		purpose  = flag.String("purpose", "", "Describe the purpose of your crawl to help the LLM make better decisions")
-		insecure = flag.Bool("insecure", false, "Skip TLS certificate verification for HTTPS sites")
-		help     = flag.Bool("help", false, "Show help message")
-	)
+	link := flag.String("link", "", "URL to crawl")
+	depth := flag.Int("depth", 0, "Crawl depth")
+	timeout := flag.Duration("timeout", 30*time.Second, "Timeout")
+	verbose := flag.Bool("verbose", false, "Verbose output")
+	llm := flag.Bool("llm", false, "Enable LLM")
+	purpose := flag.String("purpose", "", "Crawl purpose")
+	insecure := flag.Bool("insecure", false, "Skip TLS")
+	browserless := flag.String("browserless", "", "Browserless URL (e.g., https://chrome.example.com)")
+	token := flag.String("token", "", "Browserless API Token")
+	scrape := flag.Bool("scrape", false, "Output raw HTML content to stdout and exit (no parsing/crawling)")
 
 	flag.Parse()
 
-	if *help || *link == "" {
-		fmt.Println("AI-Enhanced Web Crawler CLI Tool")
-		fmt.Println("\nUsage:")
-		fmt.Printf("  %s --link <URL> [options]\n", os.Args[0])
-		fmt.Println("\nOptions:")
-		flag.PrintDefaults()
-		fmt.Println("\nLLM Setup:")
-		fmt.Println("  Set GEMINI_API_KEY environment variable to use --llm flag")
-		fmt.Println("  Get your API key at: https://makersuite.google.com/app/apikey")
-		fmt.Println("\nExamples:")
-		fmt.Printf("  # Basic crawl\n")
-		fmt.Printf("  %s --link 'https://example.com'\n", os.Args[0])
-		fmt.Printf("\n  # LLM-powered crawl with purpose\n")
-		fmt.Printf("  export GEMINI_API_KEY='your-api-key'\n")
-		fmt.Printf("  %s --link 'https://techcrunch.com' --llm --purpose 'find AI and machine learning news' --depth 2 --verbose\n", os.Args[0])
-		
-		if *link == "" && !*help {
-			fmt.Println("\nError: --link flag is required")
-			os.Exit(1)
-		}
-		os.Exit(0)
+	if *link == "" {
+		fmt.Println("Usage: crawl-cli --link <URL> [--browserless <URL>] [--token <TOKEN>] [--scrape]")
+		os.Exit(1)
 	}
 
-	if !strings.HasPrefix(*link, "http://") && !strings.HasPrefix(*link, "https://") {
-		log.Fatal("Error: URL must start with http:// or https://")
+	// Check environment variable for token if flag is empty
+	if *token == "" {
+		*token = os.Getenv("BROWSERLESS_TOKEN")
 	}
 
-	if *llm {
-		if os.Getenv("GEMINI_API_KEY") == "" {
-			log.Fatal("Error: GEMINI_API_KEY environment variable is required when using --llm flag")
+	crawler := NewCrawler(*timeout, *depth, *verbose, *llm, *purpose, *insecure, *browserless, *token)
+
+	// Scrape mode: Fetch and print raw HTML
+	if *scrape {
+		var body []byte
+		var err error
+
+		if *browserless != "" {
+			body, err = crawler.fetchWithChrome(*link)
+		} else {
+			resp, reqErr := crawler.client.Get(*link)
+			if reqErr != nil {
+				err = reqErr
+			} else {
+				defer resp.Body.Close()
+				body, err = io.ReadAll(resp.Body)
+			}
 		}
-		fmt.Println("LLM-powered crawling enabled with Gemini 2.5 Flash")
-		if *purpose != "" {
-			fmt.Printf("Crawl purpose: %s\n", *purpose)
+
+		if err != nil {
+			log.Fatalf("Scrape failed: %v", err)
 		}
+
+		fmt.Print(string(body))
+		return
 	}
-
-	crawler := NewCrawler(*timeout, *depth, *verbose, *llm, *purpose, *insecure)
-
-	fmt.Printf("Starting crawl of %s (depth=%d, timeout=%v)\n", *link, *depth, *timeout)
-
+	
 	if *depth > 0 {
-		results, err := crawler.CrawlRecursive(*link, 0)
-		if err != nil {
-			log.Fatalf("Crawl failed: %v", err)
-		}
-
-		fmt.Printf("\nCrawled %d pages\n", len(results))
-
-		if *llm && len(results) > 0 {
-			avgRelevance := 0
-			totalTopics := make(map[string]int)
-			for _, result := range results {
-				avgRelevance += result.Relevance
-				for _, topic := range result.Topics {
-					totalTopics[topic]++
-				}
-			}
-			if len(results) > 0 {
-				avgRelevance /= len(results)
-			}
-
-			fmt.Printf("LLM Insights Summary:\n")
-			fmt.Printf("   Average Relevance: %d/10\n", avgRelevance)
-			fmt.Printf("   Unique Topics Found: %d\n", len(totalTopics))
-
-			if len(totalTopics) > 0 {
-				fmt.Printf("   Most Common Topics: ")
-				count := 0
-				for topic, freq := range totalTopics {
-					if count >= 3 {
-						break
-					}
-					if count > 0 {
-						fmt.Printf(", ")
-					}
-					fmt.Printf("%s (%d)", topic, freq)
-					count++
-				}
-				fmt.Println()
-			}
-		}
-
-		for _, result := range results {
-			PrintResult(result, *verbose, *llm)
-		}
+		results, _ := crawler.CrawlRecursive(*link, 0)
+		fmt.Printf("\nTotal pages crawled: %d\n", len(results))
 	} else {
-		result, err := crawler.Crawl(*link)
-		if err != nil {
-			log.Fatalf("Crawl failed: %v", err)
-		}
+		result, _ := crawler.Crawl(*link)
 		PrintResult(result, *verbose, *llm)
 	}
-
-	fmt.Printf("\nCrawl completed. Visited %d pages.\n", len(crawler.visited))
 }
